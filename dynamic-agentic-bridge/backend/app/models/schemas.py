@@ -89,7 +89,7 @@ class MCPToolCandidate(BaseModel):
     element_type: str
     semantic_intent: str
     bounding_box: dict | None = None
-    suggested_tool_schema: dict
+    suggested_tool_schema: dict = Field(default_factory=dict)
     requires_human_approval: bool = False
 
 
