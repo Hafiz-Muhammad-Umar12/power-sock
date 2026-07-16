@@ -9,10 +9,8 @@ Returns validated MCPToolCandidate objects.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
-import time
 from typing import Any
 
 import anthropic
@@ -174,8 +172,15 @@ async def map_elements(
     if not settings.anthropic_api_key:
         raise ClaudeAPIError(None, "ANTHROPIC_API_KEY is not configured")
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    # Force direct Anthropic API — ignore any ANTHROPIC_BASE_URL in the env
+    client = anthropic.AsyncAnthropic(
+        api_key=settings.anthropic_api_key,
+        base_url="https://api.anthropic.com",
+    )
     user_content = _build_user_content(screenshot_b64, accessibility_tree, url, title)
+
+    # Resolve model: parameter > config > hardcoded default
+    resolved_model = model or settings.anthropic_default_sonnet_model
 
     last_error: Exception | None = None
 
@@ -189,7 +194,7 @@ async def map_elements(
             )
 
             response = await client.messages.create(
-                model=model,
+                model=resolved_model,
                 max_tokens=4096,
                 system=MAPPER_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_content}],

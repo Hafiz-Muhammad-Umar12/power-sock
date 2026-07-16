@@ -92,6 +92,17 @@ class MCPGeneratorError(BridgeError):
     """Base for MCP generator failures."""
 
 
+# ── Executor errors ──────────────────────────────────────────────────────────
+
+
+class ExecutionError(BridgeError):
+    """Base for tool execution failures."""
+
+
+class ElementNotFoundError(ExecutionError):
+    """Could not locate the target element on the live page."""
+
+
 class ToolSchemaError(MCPGeneratorError):
     """Generated MCP tool schema is malformed or incomplete."""
 

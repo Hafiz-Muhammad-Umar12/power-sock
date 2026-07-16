@@ -16,8 +16,9 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+asyncpg://user:password@localhost:5432/dynamic_bridge"
 
-    # Anthropic API
+    # Anthropic API (direct — api.anthropic.com)
     anthropic_api_key: str = ""
+    anthropic_default_sonnet_model: str = "claude-sonnet-4-20250514"
 
     # Supabase (optional)
     supabase_url: str = ""
