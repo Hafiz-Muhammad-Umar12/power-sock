@@ -269,6 +269,7 @@ async def _execute_tool_action(
     """Background task: execute a tool action against the live legacy app."""
     from app.core.executor import execute_tool_action
     from app.core.security import CredentialEncryptor
+    from app.database import async_session_factory
 
     async with async_session_factory() as db:
         # Fetch the tool
@@ -369,7 +370,6 @@ async def execute_tool(
     and does NOT execute until the approve endpoint is called.
     """
     execute_limiter.check(request)
-    """
     tool = await _get_tool_or_404(tool_id, db)
 
     # Fetch the app via the state node

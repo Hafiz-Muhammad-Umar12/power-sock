@@ -35,6 +35,7 @@ from app.core.exceptions import (
     PageLoadTimeout,
     ScreenshotError,
 )
+from app.core.playwright_runner import run_playwright_coro
 
 logger = logging.getLogger(__name__)
 
@@ -212,22 +213,17 @@ async def _handle_auth(
 # ── Core observation ─────────────────────────────────────────────────────────
 
 
-async def observe_application(
+async def _observe_inner(
+    full_url: str,
     base_url: str,
-    auth_credentials: dict | None = None,
-    url_path: str = "/",
-    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    auth_credentials: dict | None,
+    timeout_ms: int,
 ) -> ObservationResult:
     """
-    Launch a headless browser, navigate to the legacy app, and capture
-    its UI state.
-
-    Returns an ObservationResult with no raw Playwright objects.
-    Raises typed ObserverError subclasses on failure.
+    Inner async function that runs Playwright in an isolated thread.
+    All ``await`` calls here execute inside the dedicated Playwright thread's
+    event loop, not the main FastAPI/asyncpg loop.
     """
-    full_url = base_url.rstrip("/") + "/" + url_path.lstrip("/")
-    logger.info("Starting observation of %s", full_url)
-
     playwright_instance: Playwright | None = None
     browser: Browser | None = None
 
@@ -251,7 +247,6 @@ async def observe_application(
         # ── Auth ────────────────────────────────────────────────────────
         if auth_credentials:
             await _handle_auth(page, auth_credentials, base_url)
-            # After auth, navigate to the target URL (auth may have redirected)
             current_url = page.url
             target_origin = base_url.rstrip("/")
             if not current_url.startswith(target_origin):
@@ -262,14 +257,12 @@ async def observe_application(
 
         # ── Wait for DOM stability ──────────────────────────────────────
         try:
-            # Wait for network idle (no pending requests for a beat)
             await page.wait_for_load_state("networkidle", timeout=timeout_ms)
         except Exception:
             logger.warning(
                 "Network idle timeout for %s — proceeding with current state", full_url
             )
 
-        # Additional stability wait for JS-rendered content
         await asyncio.sleep(DOM_STABILITY_WAIT_MS / 1000)
 
         # ── Capture page title ──────────────────────────────────────────
@@ -308,7 +301,7 @@ async def observe_application(
                     }
                     if (node.childNodes) {
                         for (const child of node.childNodes) {
-                            if (child.nodeType === 1) { // Element node
+                            if (child.nodeType === 1) {
                                 const serialized = serialize(child);
                                 if (serialized) result.children.push(serialized);
                             }
@@ -322,10 +315,8 @@ async def observe_application(
         except Exception as e:
             raise DOMSnapshotError(f"Failed to snapshot DOM: {e}") from e
 
-        # ── Compute state hash ──────────────────────────────────────────
         state_hash = _compute_state_hash(normalized_dom)
 
-        # ── Build result ────────────────────────────────────────────────
         result = ObservationResult(
             accessibility_tree=accessibility_tree,
             screenshot_b64=screenshot_b64,
@@ -345,12 +336,37 @@ async def observe_application(
         )
         return result
 
-    except ObserverError:
-        raise
-    except Exception as e:
-        raise ObserverError(f"Unexpected error during observation: {e}") from e
     finally:
         if browser:
             await browser.close()
         if playwright_instance:
             await playwright_instance.stop()
+
+
+async def observe_application(
+    base_url: str,
+    auth_credentials: dict | None = None,
+    url_path: str = "/",
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+) -> ObservationResult:
+    """
+    Launch a headless browser, navigate to the legacy app, and capture
+    its UI state.
+
+    Playwright runs in an isolated thread with its own event loop so that
+    ProactorEventLoop is used on Windows (required for subprocess launch).
+
+    Returns an ObservationResult with no raw Playwright objects.
+    Raises typed ObserverError subclasses on failure.
+    """
+    full_url = base_url.rstrip("/") + "/" + url_path.lstrip("/")
+    logger.info("Starting observation of %s", full_url)
+
+    try:
+        return await run_playwright_coro(
+            _observe_inner(full_url, base_url, auth_credentials, timeout_ms)
+        )
+    except ObserverError:
+        raise
+    except Exception as e:
+        raise ObserverError(f"Unexpected error during observation: {e}") from e

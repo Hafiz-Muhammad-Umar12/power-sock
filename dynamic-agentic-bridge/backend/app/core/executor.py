@@ -33,6 +33,7 @@ from app.core.exceptions import (
     ElementNotFoundError,
     NavigationError,
 )
+from app.core.playwright_runner import run_playwright_coro
 
 logger = logging.getLogger(__name__)
 
@@ -354,28 +355,20 @@ async def _perform_action(
 # ── Main executor ────────────────────────────────────────────────────────────
 
 
-async def execute_tool_action(
+async def _execute_inner(
+    full_url: str,
     base_url: str,
-    url_path: str,
     element_type: str,
     semantic_intent: str,
     bounding_box: dict | None,
     action_params: dict,
-    auth_credentials: dict | None = None,
+    auth_credentials: dict | None,
 ) -> ExecutionResult:
     """
-    Execute a tool action against a live legacy application.
-
-    1. Launches Playwright browser
-    2. Navigates to the app URL
-    3. Locates the target element
-    4. Performs the action (click/fill/select)
-    5. Captures screenshot after action
-    6. Returns structured result
+    Inner async function that runs Playwright in an isolated thread.
+    All ``await`` calls here execute inside the dedicated Playwright thread's
+    event loop, not the main FastAPI/asyncpg loop.
     """
-    full_url = base_url.rstrip("/") + "/" + url_path.lstrip("/")
-    logger.info("Executing tool: %s at %s", semantic_intent, full_url)
-
     playwright_instance: Playwright | None = None
     browser: Browser | None = None
 
@@ -455,9 +448,8 @@ async def execute_tool_action(
         try:
             await page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
-            pass  # Not all actions cause navigation
+            pass
 
-        # Brief stability wait
         await asyncio.sleep(0.5)
 
         # Capture screenshot
@@ -476,11 +468,50 @@ async def execute_tool_action(
             post_action_url=page.url,
         )
         logger.info(
-            "Tool executed successfully: %s → %s at %s",
+            "Tool executed successfully: %s -> %s at %s",
             semantic_intent, action_desc, page.url,
         )
         return result
 
+    finally:
+        if browser:
+            await browser.close()
+        if playwright_instance:
+            await playwright_instance.stop()
+
+
+async def execute_tool_action(
+    base_url: str,
+    url_path: str,
+    element_type: str,
+    semantic_intent: str,
+    bounding_box: dict | None,
+    action_params: dict,
+    auth_credentials: dict | None = None,
+) -> ExecutionResult:
+    """
+    Execute a tool action against a live legacy application.
+
+    Playwright runs in an isolated thread with its own event loop so that
+    ProactorEventLoop is used on Windows (required for subprocess launch).
+
+    1. Launches Playwright browser
+    2. Navigates to the app URL
+    3. Locates the target element
+    4. Performs the action (click/fill/select)
+    5. Captures screenshot after action
+    6. Returns structured result
+    """
+    full_url = base_url.rstrip("/") + "/" + url_path.lstrip("/")
+    logger.info("Executing tool: %s at %s", semantic_intent, full_url)
+
+    try:
+        return await run_playwright_coro(
+            _execute_inner(
+                full_url, base_url, element_type, semantic_intent,
+                bounding_box, action_params, auth_credentials,
+            )
+        )
     except ExecutionError:
         raise
     except Exception as e:
@@ -490,8 +521,3 @@ async def execute_tool_action(
             element_found=False,
             error_message=f"Unexpected error: {_sanitize_error(e)}",
         )
-    finally:
-        if browser:
-            await browser.close()
-        if playwright_instance:
-            await playwright_instance.stop()

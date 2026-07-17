@@ -17,7 +17,7 @@ makemigration: ## Generate a new migration (autogenerate from models)
 	alembic revision --autogenerate -m "$(msg)"
 
 run: ## Start the dev server
-	uvicorn app.main:app --reload --port 8000
+	uvicorn app.main:app --reload --port 8001
 
 test: ## Run all tests
 	python -m pytest tests/ -v

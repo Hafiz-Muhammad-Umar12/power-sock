@@ -1,5 +1,5 @@
 """
-Tests for mapper.py — mocked Anthropic API client.
+Tests for mapper.py — mocked Ollama HTTP API.
 Tests map_elements with various API responses and error conditions.
 """
 
@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
-from app.core.mapper import map_elements
+from app.core.mapper import map_elements, _call_ollama
 from app.core.exceptions import (
     ClaudeAPIError,
     ClaudeRateLimitError,
@@ -20,30 +21,135 @@ from app.core.exceptions import (
 from app.models.schemas import MCPToolCandidate
 
 
-def _mock_response(text: str) -> MagicMock:
-    """Create a mock Anthropic API response with the given text."""
-    block = MagicMock()
-    block.type = "text"
-    block.text = text
-    response = MagicMock()
-    response.content = [block]
-    return response
+def _mock_ollama_response(content: str, status_code: int = 200) -> httpx.Response:
+    """Create a mock httpx.Response for Ollama chat API."""
+    body = json.dumps({
+        "model": "moondream",
+        "message": {"role": "assistant", "content": content},
+        "done": True,
+    })
+    return httpx.Response(
+        status_code=status_code,
+        content=body.encode(),
+        request=httpx.Request("POST", "http://localhost:11434/api/chat"),
+    )
 
 
-def _mock_rate_limit_response() -> MagicMock:
-    """Create a mock rate limit error response."""
-    resp = MagicMock()
-    resp.headers = {"retry-after": "5"}
-    err = MagicMock()
-    err.response = resp
-    err.status_code = 429
-    return err
+def _mock_ollama_candidates(candidates: list[dict]) -> httpx.Response:
+    """Create a mock response with a candidates JSON array."""
+    return _mock_ollama_response(json.dumps(candidates))
+
+
+class TestCallOllama:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        """_call_ollama returns response text on success."""
+        candidates = [{"element_type": "button", "semantic_intent": "Click"}]
+        resp = _mock_ollama_candidates(candidates)
+
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            result = await _call_ollama(
+                messages=[{"role": "user", "content": "test"}],
+                model="moondream",
+            )
+
+        parsed = json.loads(result)
+        assert len(parsed) == 1
+        assert parsed[0]["element_type"] == "button"
+
+    @pytest.mark.asyncio
+    async def test_model_not_found(self):
+        """_call_ollama raises ClaudeAPIError on 404."""
+        resp = httpx.Response(
+            status_code=404,
+            content=b"model not found",
+            request=httpx.Request("POST", "http://localhost:11434/api/chat"),
+        )
+
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(ClaudeAPIError, match="not found"):
+                await _call_ollama(
+                    messages=[{"role": "user", "content": "test"}],
+                    model="nonexistent",
+                )
+
+    @pytest.mark.asyncio
+    async def test_server_error(self):
+        """_call_ollama raises ClaudeAPIError on non-200 status."""
+        resp = httpx.Response(
+            status_code=500,
+            content=b"internal error",
+            request=httpx.Request("POST", "http://localhost:11434/api/chat"),
+        )
+
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(ClaudeAPIError, match="500"):
+                await _call_ollama(
+                    messages=[{"role": "user", "content": "test"}],
+                    model="moondream",
+                )
+
+    @pytest.mark.asyncio
+    async def test_timeout(self):
+        """map_elements catches timeout from _call_ollama."""
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            with patch("app.core.mapper.settings") as mock_settings:
+                mock_settings.ollama_base_url = "http://localhost:11434"
+                mock_settings.ollama_model = "moondream"
+                with pytest.raises(ClaudeAPIError, match="timed out"):
+                    await map_elements(
+                        screenshot_b64=None,
+                        accessibility_tree={},
+                        url="https://example.com",
+                        title="Test",
+                    )
+
+    @pytest.mark.asyncio
+    async def test_empty_response(self):
+        """_call_ollama raises VisionMappingError on empty content."""
+        resp = _mock_ollama_response("")
+
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(VisionMappingError, match="empty response"):
+                await _call_ollama(
+                    messages=[{"role": "user", "content": "test"}],
+                    model="moondream",
+                )
 
 
 class TestMapElements:
     @pytest.mark.asyncio
     async def test_success_single_candidate(self):
-        """map_elements returns validated candidates from Claude."""
+        """map_elements returns validated candidates from Ollama."""
         candidates = [
             {
                 "element_type": "button",
@@ -52,14 +158,17 @@ class TestMapElements:
                 "requires_human_approval": True,
             }
         ]
-        api_response = _mock_response(json.dumps(candidates))
+        resp = _mock_ollama_candidates(candidates)
 
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=api_response)
-
-        with patch("app.core.mapper.anthropic.AsyncAnthropic", return_value=mock_client):
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
             with patch("app.core.mapper.settings") as mock_settings:
-                mock_settings.anthropic_api_key = "sk-ant-test"
+                mock_settings.ollama_base_url = "http://localhost:11434"
+                mock_settings.ollama_model = "moondream"
                 result = await map_elements(
                     screenshot_b64="fake_base64",
                     accessibility_tree={"role": "WebArea"},
@@ -81,14 +190,17 @@ class TestMapElements:
             {"element_type": "link", "semantic_intent": "Go to B", "suggested_tool_schema": {}},
             {"element_type": "input", "semantic_intent": "Enter text", "suggested_tool_schema": {}, "requires_human_approval": True},
         ]
-        api_response = _mock_response(json.dumps(candidates))
+        resp = _mock_ollama_candidates(candidates)
 
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=api_response)
-
-        with patch("app.core.mapper.anthropic.AsyncAnthropic", return_value=mock_client):
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
             with patch("app.core.mapper.settings") as mock_settings:
-                mock_settings.anthropic_api_key = "sk-ant-test"
+                mock_settings.ollama_base_url = "http://localhost:11434"
+                mock_settings.ollama_model = "moondream"
                 result = await map_elements(
                     screenshot_b64="fake",
                     accessibility_tree={},
@@ -100,18 +212,28 @@ class TestMapElements:
         assert all(isinstance(c, MCPToolCandidate) for c in result)
 
     @pytest.mark.asyncio
-    async def test_strips_markdown_fences(self):
-        """map_elements strips ```json fences from Claude response."""
-        candidates = [{"element_type": "button", "semantic_intent": "Click", "suggested_tool_schema": {}}]
-        fenced = f"```json\n{json.dumps(candidates)}\n```"
-        api_response = _mock_response(fenced)
+    async def test_retries_on_invalid_json(self):
+        """map_elements retries on invalid JSON, then succeeds."""
+        valid_candidates = [{"element_type": "button", "semantic_intent": "Click", "suggested_tool_schema": {}}]
+        invalid_resp = _mock_ollama_response("not valid json")
+        valid_resp = _mock_ollama_candidates(valid_candidates)
 
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=api_response)
+        call_count = 0
 
-        with patch("app.core.mapper.anthropic.AsyncAnthropic", return_value=mock_client):
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return invalid_resp if call_count == 1 else valid_resp
+
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=side_effect)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
             with patch("app.core.mapper.settings") as mock_settings:
-                mock_settings.anthropic_api_key = "sk-ant-test"
+                mock_settings.ollama_base_url = "http://localhost:11434"
+                mock_settings.ollama_model = "moondream"
                 result = await map_elements(
                     screenshot_b64=None,
                     accessibility_tree={},
@@ -120,23 +242,57 @@ class TestMapElements:
                 )
 
         assert len(result) == 1
+        assert call_count == 2  # initial + 1 retry
 
     @pytest.mark.asyncio
-    async def test_empty_response_raises(self):
-        """map_elements raises VisionMappingError on empty response."""
-        block = MagicMock()
-        block.type = "text"
-        block.text = ""
-        response = MagicMock()
-        response.content = [block]
+    async def test_retries_on_validation_failure(self):
+        """map_elements retries when model returns invalid candidates."""
+        invalid = [{"bad_field": "data"}]
+        valid = [{"element_type": "button", "semantic_intent": "Click", "suggested_tool_schema": {}}]
+        invalid_resp = _mock_ollama_candidates(invalid)
+        valid_resp = _mock_ollama_candidates(valid)
 
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=response)
+        call_count = 0
 
-        with patch("app.core.mapper.anthropic.AsyncAnthropic", return_value=mock_client):
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return invalid_resp if call_count == 1 else valid_resp
+
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=side_effect)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
             with patch("app.core.mapper.settings") as mock_settings:
-                mock_settings.anthropic_api_key = "sk-ant-test"
-                with pytest.raises(VisionMappingError, match="empty response"):
+                mock_settings.ollama_base_url = "http://localhost:11434"
+                mock_settings.ollama_model = "moondream"
+                result = await map_elements(
+                    screenshot_b64=None,
+                    accessibility_tree={},
+                    url="https://example.com",
+                    title="Test",
+                )
+
+        assert len(result) == 1
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_candidates_raises(self):
+        """map_elements raises VisionMappingError when no candidates returned."""
+        resp = _mock_ollama_candidates([])
+
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            with patch("app.core.mapper.settings") as mock_settings:
+                mock_settings.ollama_base_url = "http://localhost:11434"
+                mock_settings.ollama_model = "moondream"
+                with pytest.raises(VisionMappingError, match="no tool candidates"):
                     await map_elements(
                         screenshot_b64=None,
                         accessibility_tree={},
@@ -145,17 +301,18 @@ class TestMapElements:
                     )
 
     @pytest.mark.asyncio
-    async def test_invalid_json_retries_then_fails(self):
-        """map_elements retries once on invalid JSON, then raises."""
-        invalid_response = _mock_response("not valid json at all")
-
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=invalid_response)
-
-        with patch("app.core.mapper.anthropic.AsyncAnthropic", return_value=mock_client):
+    async def test_connection_error(self):
+        """map_elements raises ClaudeAPIError on connection failure."""
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
             with patch("app.core.mapper.settings") as mock_settings:
-                mock_settings.anthropic_api_key = "sk-ant-test"
-                with pytest.raises(Exception):  # JSONDecodeError or VisionMappingError
+                mock_settings.ollama_base_url = "http://localhost:11434"
+                mock_settings.ollama_model = "moondream"
+                with pytest.raises(ClaudeAPIError, match="connection error"):
                     await map_elements(
                         screenshot_b64=None,
                         accessibility_tree={},
@@ -163,15 +320,21 @@ class TestMapElements:
                         title="Test",
                     )
 
-        # Should have been called twice (initial + retry)
-        assert mock_client.messages.create.call_count == 2
-
     @pytest.mark.asyncio
-    async def test_no_api_key_raises(self):
-        """map_elements raises ClaudeAPIError when no API key configured."""
-        with patch("app.core.mapper.settings") as mock_settings:
-            mock_settings.anthropic_api_key = ""
-            with pytest.raises(ClaudeAPIError, match="not configured"):
+    async def test_format_json_request(self):
+        """Verify format='json' is sent in the Ollama request."""
+        candidates = [{"element_type": "button", "semantic_intent": "Click", "suggested_tool_schema": {}}]
+        resp = _mock_ollama_candidates(candidates)
+
+        with patch("app.core.mapper.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            with patch("app.core.mapper.settings") as mock_settings:
+                mock_settings.ollama_base_url = "http://localhost:11434"
+                mock_settings.ollama_model = "moondream"
                 await map_elements(
                     screenshot_b64=None,
                     accessibility_tree={},
@@ -179,25 +342,8 @@ class TestMapElements:
                     title="Test",
                 )
 
-    @pytest.mark.asyncio
-    async def test_rate_limit_error(self):
-        """map_elements raises ClaudeRateLimitError on 429."""
-        import anthropic
-        err = anthropic.RateLimitError(
-            message="Rate limited",
-            response=MagicMock(status_code=429, headers={"retry-after": "5"}),
-            body=None,
-        )
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(side_effect=err)
-
-        with patch("app.core.mapper.anthropic.AsyncAnthropic", return_value=mock_client):
-            with patch("app.core.mapper.settings") as mock_settings:
-                mock_settings.anthropic_api_key = "sk-ant-test"
-                with pytest.raises(ClaudeRateLimitError):
-                    await map_elements(
-                        screenshot_b64=None,
-                        accessibility_tree={},
-                        url="https://example.com",
-                        title="Test",
-                    )
+        call_kwargs = mock_client.post.call_args
+        json_body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+        assert json_body["format"] == "json"
+        assert json_body["model"] == "moondream"
+        assert json_body["stream"] is False

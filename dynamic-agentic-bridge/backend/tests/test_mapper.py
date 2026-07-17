@@ -1,6 +1,6 @@
 """
 Unit tests for the mapper module.
-Anthropic API is mocked — we test parsing, validation, and error handling.
+Tests parsing, validation, and message building (no API calls).
 """
 
 import json
@@ -8,7 +8,7 @@ import json
 import pytest
 
 from app.core.mapper import (
-    _build_user_content,
+    _build_ollama_messages,
     _parse_candidates,
     _validate_candidates,
 )
@@ -36,8 +36,15 @@ class TestParseCandidates:
         result = _parse_candidates(raw)
         assert len(result) == 1
 
-    def test_raises_on_non_array(self):
-        raw = '{"element_type": "button"}'
+    def test_single_dict_wrapped_as_candidate(self):
+        """Single dict with element_type is treated as one candidate."""
+        raw = '{"element_type": "button", "semantic_intent": "Click"}'
+        result = _parse_candidates(raw)
+        assert len(result) == 1
+        assert result[0]["element_type"] == "button"
+
+    def test_raises_on_unrelated_dict(self):
+        raw = '{"foo": "bar", "baz": 42}'
         with pytest.raises(VisionMappingError, match="Expected JSON array"):
             _parse_candidates(raw)
 
@@ -50,6 +57,13 @@ class TestParseCandidates:
         raw = '[]'
         result = _parse_candidates(raw)
         assert result == []
+
+    def test_unwraps_candidates_dict(self):
+        """Ollama may wrap response in {"candidates": [...]}."""
+        raw = '{"candidates": [{"element_type": "button", "semantic_intent": "Click"}]}'
+        result = _parse_candidates(raw)
+        assert len(result) == 1
+        assert result[0]["element_type"] == "button"
 
 
 class TestValidateCandidates:
@@ -71,19 +85,17 @@ class TestValidateCandidates:
         assert len(result) == 2
         assert isinstance(result[0], MCPToolCandidate)
         assert result[0].requires_human_approval is True
-        assert result[1].requires_human_approval is False  # default
+        assert result[1].requires_human_approval is False
 
     def test_empty_list(self):
         result = _validate_candidates([])
         assert result == []
 
-    def test_invalid_candidate_raises(self):
+    def test_partial_valid(self):
         raw = [
             {"element_type": "button", "semantic_intent": "Click me"},
-            {"no_element_type": "bad"},  # Missing required fields
+            {"no_element_type": "bad"},
         ]
-        # Should raise since ALL candidates fail (only 1 valid, 1 invalid)
-        # Actually, only 1 valid and 1 invalid — it should return the valid one
         result = _validate_candidates(raw)
         assert len(result) == 1
         assert result[0].semantic_intent == "Click me"
@@ -94,49 +106,41 @@ class TestValidateCandidates:
             _validate_candidates(raw)
 
     def test_suggested_tool_schema_defaults_to_empty(self):
-        raw = [
-            {
-                "element_type": "button",
-                "semantic_intent": "Click",
-                # No suggested_tool_schema
-            }
-        ]
+        raw = [{"element_type": "button", "semantic_intent": "Click"}]
         result = _validate_candidates(raw)
         assert result[0].suggested_tool_schema == {}
 
 
-class TestBuildUserContent:
+class TestBuildOllamaMessages:
     def test_with_screenshot(self):
-        content = _build_user_content(
+        messages = _build_ollama_messages(
             screenshot_b64="abc123",
             accessibility_tree={"role": "WebArea", "name": "Test"},
             url="https://example.com",
             title="Test Page",
         )
-        assert len(content) == 3  # text + image + a11y tree
-        assert content[0]["type"] == "text"
-        assert content[1]["type"] == "image"
-        assert content[1]["source"]["data"] == "abc123"
-        assert content[2]["type"] == "text"
+        assert len(messages) == 2  # system + user
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        assert messages[1]["images"] == ["abc123"]
+        assert "example.com" in messages[1]["content"]
 
     def test_without_screenshot(self):
-        content = _build_user_content(
+        messages = _build_ollama_messages(
             screenshot_b64=None,
             accessibility_tree={},
             url="https://example.com",
             title="",
         )
-        assert len(content) == 2  # text + a11y tree only
-        assert content[0]["type"] == "text"
-        assert content[1]["type"] == "text"  # a11y tree
+        assert len(messages) == 2
+        assert "images" not in messages[1]
 
     def test_truncates_large_a11y_tree(self):
         large_tree = {"children": [{"data": "x" * 100_000}]}
-        content = _build_user_content(
+        messages = _build_ollama_messages(
             screenshot_b64=None,
             accessibility_tree=large_tree,
             url="https://example.com",
             title="",
         )
-        a11y_text = content[1]["text"]
-        assert "truncated" in a11y_text
+        assert "truncated" in messages[1]["content"]

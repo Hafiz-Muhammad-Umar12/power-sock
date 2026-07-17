@@ -213,7 +213,7 @@ async def main():
     print("\n[6/6] Testing full API endpoint flow...")
     import httpx as httpx_sync
 
-    async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=15) as api:
+    async with httpx.AsyncClient(base_url="http://localhost:8001", timeout=15) as api:
         # Execute via API
         resp = await api.post(f"/api/tools/{tool_id}/execute", json={
             "tool_id": str(tool_id),

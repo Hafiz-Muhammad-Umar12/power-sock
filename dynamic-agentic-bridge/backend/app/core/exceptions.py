@@ -58,15 +58,15 @@ class MapperError(BridgeError):
 
 
 class ClaudeAPIError(MapperError):
-    """Anthropic API call failed (rate limit, auth, server error)."""
+    """LLM provider API call failed (rate limit, auth, server error)."""
 
     def __init__(self, status_code: int | None, message: str) -> None:
         self.status_code = status_code
-        super().__init__(f"Claude API error ({status_code}): {message}")
+        super().__init__(f"Provider API error ({status_code}): {message}")
 
 
 class ClaudeRateLimitError(ClaudeAPIError):
-    """Rate limited by Anthropic API — caller should back off."""
+    """Rate limited by LLM provider API — caller should back off."""
 
     def __init__(self, retry_after: float | None = None) -> None:
         self.retry_after = retry_after
@@ -74,11 +74,11 @@ class ClaudeRateLimitError(ClaudeAPIError):
 
 
 class VisionMappingError(MapperError):
-    """Claude returned a response that could not be parsed as valid tool candidates."""
+    """LLM returned a response that could not be parsed as valid tool candidates."""
 
 
 class SchemaValidationError(MapperError):
-    """Claude's output failed Pydantic validation after retry."""
+    """LLM output failed Pydantic validation after retry."""
 
     def __init__(self, errors: list[dict]) -> None:
         self.validation_errors = errors

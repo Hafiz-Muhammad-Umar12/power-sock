@@ -16,7 +16,15 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+asyncpg://user:password@localhost:5432/dynamic_bridge"
 
-    # Anthropic API (direct — api.anthropic.com)
+    # Ollama (local LLM, no API costs)
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "moondream"
+
+    # OpenAI API (reserved for future use)
+    openai_api_key: str = ""
+    openai_vision_model: str = "gpt-4o"
+
+    # Anthropic API (reserved for future use)
     anthropic_api_key: str = ""
     anthropic_default_sonnet_model: str = "claude-sonnet-4-20250514"
 
