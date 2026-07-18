@@ -43,14 +43,17 @@ class TestParseCandidates:
         assert len(result) == 1
         assert result[0]["element_type"] == "button"
 
-    def test_raises_on_unrelated_dict(self):
-        raw = '{"foo": "bar", "baz": 42}'
-        with pytest.raises(VisionMappingError, match="Expected JSON array"):
-            _parse_candidates(raw)
+    def test_dict_with_string_values_treated_as_candidate(self):
+        """Any dict with string values is treated as a candidate (moondream compat)."""
+        raw = '{"foo": "bar", "baz": "qux"}'
+        result = _parse_candidates(raw)
+        assert len(result) == 1
+        # Should get default element_type and semantic_intent
+        assert result[0]["element_type"] == "element"
 
     def test_raises_on_invalid_json(self):
         raw = 'not json at all'
-        with pytest.raises(json.JSONDecodeError):
+        with pytest.raises(VisionMappingError, match="Could not parse JSON"):
             _parse_candidates(raw)
 
     def test_empty_array(self):
@@ -143,4 +146,5 @@ class TestBuildOllamaMessages:
             url="https://example.com",
             title="",
         )
-        assert "truncated" in messages[1]["content"]
+        # Tree should be trimmed well under the text-only cap
+        assert len(messages[1]["content"]) < 10_000

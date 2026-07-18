@@ -245,11 +245,10 @@ class TestMapElements:
         assert call_count == 2  # initial + 1 retry
 
     @pytest.mark.asyncio
-    async def test_retries_on_validation_failure(self):
-        """map_elements retries when model returns invalid candidates."""
-        invalid = [{"bad_field": "data"}]
+    async def test_retries_on_invalid_json(self):
+        """map_elements retries when model returns unparseable JSON."""
         valid = [{"element_type": "button", "semantic_intent": "Click", "suggested_tool_schema": {}}]
-        invalid_resp = _mock_ollama_candidates(invalid)
+        invalid_resp = _mock_ollama_response("not valid json at all")
         valid_resp = _mock_ollama_candidates(valid)
 
         call_count = 0
@@ -276,7 +275,7 @@ class TestMapElements:
                 )
 
         assert len(result) == 1
-        assert call_count == 2
+        assert call_count == 2  # initial + 1 retry
 
     @pytest.mark.asyncio
     async def test_empty_candidates_raises(self):

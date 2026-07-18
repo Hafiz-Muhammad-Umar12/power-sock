@@ -270,8 +270,35 @@ async def _observe_inner(
 
         # ── Capture accessibility tree ──────────────────────────────────
         try:
-            a11y_snapshot = await page.accessibility.snapshot()
-            accessibility_tree = a11y_snapshot if isinstance(a11y_snapshot, dict) else {}
+            # Playwright 1.40+ removed page.accessibility; use CDP instead
+            cdp = await page.context.new_cdp_session(page)
+            ax_tree = await cdp.send("Accessibility.getFullAXTree")
+
+            # Build tree from flat AX nodes using parentId links
+            raw_nodes = ax_tree.get("nodes", [])
+            node_map: dict[str, dict] = {}
+            for n in raw_nodes:
+                node_id = n["nodeId"]
+                node_map[node_id] = {
+                    "role": n.get("role", {}).get("value", ""),
+                    "name": n.get("name", {}).get("value", ""),
+                    "children": [],
+                }
+            # Wire parent → children, collect child IDs
+            child_ids: set[str] = set()
+            for n in raw_nodes:
+                node_id = n["nodeId"]
+                parent_id = n.get("parentId")
+                if parent_id and parent_id in node_map:
+                    node_map[parent_id]["children"].append(node_map[node_id])
+                    child_ids.add(node_id)
+            # Root = any node that is nobody's child
+            root_id = next(
+                (nid for nid in node_map if nid not in child_ids),
+                list(node_map.keys())[0] if node_map else None,
+            )
+            accessibility_tree = node_map[root_id] if root_id else {}
+            await cdp.detach()
         except Exception as e:
             logger.warning("Failed to capture accessibility tree: %s", e)
             accessibility_tree = {}

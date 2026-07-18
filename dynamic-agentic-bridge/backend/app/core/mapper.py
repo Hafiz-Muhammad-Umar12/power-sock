@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 from typing import Any
 
 import httpx
+from PIL import Image
 from pydantic import ValidationError
 
 from app.config import settings
@@ -35,52 +37,87 @@ from app.models.schemas import MCPToolCandidate
 logger = logging.getLogger(__name__)
 
 # Retry config
-MAX_RETRIES = 2  # Local model may need more retries
+MAX_RETRIES = 4  # Local model is inconsistent; give more chances
 INITIAL_BACKOFF_S = 1.0
 MAX_BACKOFF_S = 10.0
 DEFAULT_MODEL = "moondream"
 
-# Timeout for Ollama API calls (local, but inference can be slow)
-OLLAMA_TIMEOUT_S = 120
+# Timeout for Ollama API calls (local model on CPU can be slow with images)
+OLLAMA_TIMEOUT_S = 300
 
 
 # ── System prompt ────────────────────────────────────────────────────────────
 
 MAPPER_SYSTEM_PROMPT = """\
-You are a UI analysis expert. Your task is to identify interactive UI elements \
-from a screenshot and accessibility tree of a legacy web application, and map \
-each element to a structured tool definition that an AI agent could call.
-
-For each interactive element you identify, provide:
-- element_type: The HTML element type (button, input, select, link, form, table, etc.)
-- semantic_intent: A clear description of what this element does \
-(e.g. "submit purchase order", "filter results by date range", "navigate to reports page")
-- bounding_box: Approximate position {x, y, width, height} as percentages of viewport
-- suggested_tool_schema: A JSON Schema object describing the input parameters \
-this tool would accept (empty object {} if no parameters needed)
-- requires_human_approval: true if this element performs a destructive action, \
-submits data, spends money, or modifies external state; false for read-only \
-navigation, filtering, or viewing actions
-
-Focus on genuinely interactive elements: buttons, links, form inputs, dropdowns, \
-tables with action columns, and navigation elements. Ignore purely decorative \
-elements, static text, and layout containers.
-
-IMPORTANT: You MUST respond with ONLY a valid JSON array of tool candidate objects. \
-No markdown, no explanation, no text before or after the JSON. \
-Example format: [{"element_type": "button", "semantic_intent": "...", \
-"suggested_tool_schema": {}, "requires_human_approval": false}]"""
+Look at the screenshot. Find buttons, links, and form fields.
+Reply with a JSON array. Each item has: element_type, semantic_intent.
+element_type is button, link, input, or select.
+semantic_intent describes what the element does in 5 words or fewer.
+Example: [{"element_type":"button","semantic_intent":"submit the form"},
+{"element_type":"link","semantic_intent":"go to home page"}]
+Reply ONLY with the JSON array, nothing else."""
 
 MAPPER_USER_TEMPLATE = """\
-Analyze this UI screenshot and accessibility tree from {url} (page title: "{title}").
-
-The accessibility tree describes the DOM structure. Use both the screenshot and \
-the tree to identify interactive elements.
+This is a screenshot of {url} (title: "{title}").
+List the interactive elements you see: buttons, links, inputs, selects.
 
 Return ALL MCP tool candidates you find as a JSON array."""
 
 
 # ── Core mapper ──────────────────────────────────────────────────────────────
+
+
+def _flatten_a11y_tree(node: dict, depth: int = 0, max_depth: int = 5) -> str:
+    """
+    Flatten an accessibility tree into a compact text summary.
+    Small models like moondream handle text lists better than nested JSON.
+    """
+    lines: list[str] = []
+    role = node.get("role", "")
+    name = node.get("name", "")
+    if role and role not in ("none", "presentation", "RootWebArea"):
+        indent = "  " * depth
+        label = f"{role}: {name}" if name else role
+        lines.append(f"{indent}- {label}")
+    children = node.get("children", [])
+    if children and depth < max_depth:
+        for child in children:
+            lines.extend(_flatten_a11y_tree(child, depth + (1 if role and role not in ("none", "RootWebArea") else 0), max_depth))
+    return lines
+
+
+# ~4 chars per token (conservative for English + JSON)
+CHARS_PER_TOKEN = 4
+# moondream hard limit: 2048 tokens. Reserve ~200 for system prompt + user template.
+# Image occupies ~500-1500 tokens depending on size, but we can't predict exactly.
+# Conservative: budget 800 tokens (~3200 chars) for the a11y text when image present,
+# 1600 tokens (~6400 chars) when no image.
+MAX_A11Y_CHARS_WITH_IMAGE = 3_200
+MAX_A11Y_CHARS_TEXT_ONLY = 6_400
+
+
+# Max dimension for screenshots sent to Ollama (moondream works best <512px)
+OLLAMA_MAX_IMAGE_DIM = 512
+
+
+def _resize_screenshot(screenshot_b64: str, max_dim: int = OLLAMA_MAX_IMAGE_DIM) -> str:
+    """Resize a base64 PNG screenshot to fit within max_dim pixels."""
+    img_bytes = base64.b64decode(screenshot_b64)
+    img = Image.open(io.BytesIO(img_bytes))
+    w, h = img.size
+    if max(w, h) <= max_dim:
+        return screenshot_b64
+    ratio = max_dim / max(w, h)
+    new_w, new_h = int(w * ratio), int(h * ratio)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    resized = base64.b64encode(buf.getvalue()).decode("ascii")
+    logger.info(
+        "Resized screenshot %dx%d -> %dx%d (%d -> %d chars b64)",
+        w, h, new_w, new_h, len(screenshot_b64), len(resized),
+    )
+    return resized
 
 
 def _build_ollama_messages(
@@ -92,16 +129,19 @@ def _build_ollama_messages(
     """Build the messages array for the Ollama chat API."""
     user_text = MAPPER_USER_TEMPLATE.format(url=url, title=title or "Untitled")
 
-    # Add accessibility tree context
-    a11y_text = json.dumps(accessibility_tree, indent=2, ensure_ascii=False)
-    max_a11y_chars = 30_000  # Smaller limit for local models
-    if len(a11y_text) > max_a11y_chars:
-        a11y_text = a11y_text[:max_a11y_chars] + "\n... (truncated)"
-    user_text += f"\n\nAccessibility tree:\n```json\n{a11y_text}\n```"
+    # Only include a11y tree for text-only mode (no image).
+    # Small vision models like moondream loop recursively when given
+    # a11y text alongside an image — they echo the text back infinitely.
+    if not screenshot_b64:
+        flat_lines = _flatten_a11y_tree(accessibility_tree)
+        a11y_text = "\n".join(flat_lines) if flat_lines else "(empty)"
+        max_chars = MAX_A11Y_CHARS_TEXT_ONLY
+        if len(a11y_text) > max_chars:
+            a11y_text = a11y_text[:max_chars] + "..."
+        user_text += f"\n\nAccessibility tree:\n{a11y_text}"
 
     message: dict[str, Any] = {"role": "user", "content": user_text}
 
-    # Add screenshot as base64 image (Ollama's image format)
     if screenshot_b64:
         message["images"] = [screenshot_b64]
 
@@ -137,12 +177,22 @@ def _coerce_candidate(raw: dict) -> dict:
         elif "text" in result:
             result["semantic_intent"] = result.pop("text")
 
-    # Ensure element_type is a string
-    if "element_type" in result and not isinstance(result["element_type"], str):
+    # Ensure element_type is a string (default to "element" if missing)
+    if "element_type" not in result:
+        result["element_type"] = "element"
+    elif not isinstance(result["element_type"], str):
         result["element_type"] = str(result["element_type"])
 
-    # Ensure semantic_intent is a string
-    if "semantic_intent" in result and not isinstance(result["semantic_intent"], str):
+    # Ensure semantic_intent is a string (default to description if missing)
+    if "semantic_intent" not in result:
+        # Try to build from whatever keys exist
+        for key in ("description", "text", "content", "label", "title"):
+            if key in result and isinstance(result[key], str):
+                result["semantic_intent"] = result.pop(key)
+                break
+        else:
+            result["semantic_intent"] = "UI element"
+    elif not isinstance(result["semantic_intent"], str):
         result["semantic_intent"] = str(result["semantic_intent"])
 
     # Fix bounding_box: list → dict
@@ -171,11 +221,12 @@ def _coerce_candidate(raw: dict) -> dict:
 def _parse_candidates(raw_text: str) -> list[dict]:
     """Parse LLM response text into a list of candidate dicts.
 
-    Handles various shapes from different models:
+    Handles various shapes from different models, including malformed output
+    from small local models like moondream:
     - JSON array of candidates (ideal)
-    - Single candidate dict (moondream) → wraps in list
-    - Dict with a key containing a list ({"candidates": [...]}) → unwraps
-    - Dict with any key whose value is a list → unwraps
+    - Single candidate dict → wraps in list
+    - Truncated JSON → attempts repair
+    - Dict with any key/value pairs → coerces to candidate
     """
     text = raw_text.strip()
 
@@ -187,26 +238,69 @@ def _parse_candidates(raw_text: str) -> list[dict]:
         text = text[:-3]
     text = text.strip()
 
-    parsed = json.loads(text)
+    # Try parsing as-is first
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Attempt repair: truncate at last complete object boundary
+        repaired = _attempt_json_repair(text)
+        if repaired is not None:
+            parsed = repaired
 
-    # Case 1: already a list — ideal
+    if parsed is None:
+        raise VisionMappingError(f"Could not parse JSON from response")
+
+    # Case 1: already a list
     if isinstance(parsed, list):
         return [_coerce_candidate(c) for c in parsed if isinstance(c, dict)]
 
-    # Case 2: single dict that looks like a candidate → wrap in list
+    # Case 2: single dict — treat as a candidate
     if isinstance(parsed, dict):
-        candidate_keys = {"element_type", "semantic_intent", "type", "role", "name", "label"}
-        if candidate_keys & set(parsed.keys()):
+        if any(isinstance(v, str) for v in parsed.values()):
             return [_coerce_candidate(parsed)]
-
-        # Case 3: dict with a key whose value is a list — unwrap
-        for key, val in parsed.items():
+        for val in parsed.values():
             if isinstance(val, list) and val and isinstance(val[0], dict):
                 return [_coerce_candidate(c) for c in val if isinstance(c, dict)]
 
     raise VisionMappingError(
         f"Expected JSON array or candidate object, got {type(parsed).__name__}"
     )
+
+
+def _attempt_json_repair(text: str) -> list | dict | None:
+    """
+    Attempt to repair truncated/malformed JSON from small models.
+    Common pattern: model runs out of tokens mid-object, leaving incomplete JSON.
+    """
+    # Strategy 1: find the last complete }, ] or } and truncate there
+    for end_char in ("]}", "]", "}"):
+        idx = text.rfind(end_char)
+        if idx > 0:
+            candidate = text[: idx + len(end_char)]
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, (list, dict)):
+                    logger.warning("Repaired truncated JSON by cutting at pos %d", idx)
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+    # Strategy 2: try wrapping incomplete object in array brackets
+    if text.startswith("{") and not text.startswith("["):
+        # Find the last complete key-value pair
+        last_brace = text.rfind("}")
+        if last_brace > 0:
+            candidate = text[: last_brace + 1] + "]"
+            try:
+                parsed = json.loads("[" + text[: last_brace + 1])
+                if isinstance(parsed, list) and parsed:
+                    logger.warning("Repaired incomplete object by wrapping in array")
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+    return None
 
 
 def _validate_candidates(raw_candidates: list[dict]) -> list[MCPToolCandidate]:
@@ -254,7 +348,8 @@ async def _call_ollama(
                 "format": "json",
                 "stream": False,
                 "options": {
-                    "temperature": 0.1,  # Low temp for structured output
+                    "temperature": 0.1,
+                    "num_ctx": 8192,
                 },
             },
         )
@@ -273,6 +368,8 @@ async def _call_ollama(
 
     data = response.json()
     content = data.get("message", {}).get("content", "")
+
+    logger.info("[MOONDREAM RAW] %s", content[:1500] if content else "<empty>")
 
     if not content:
         raise VisionMappingError("Ollama returned an empty response")
@@ -300,6 +397,10 @@ async def map_elements(
     """
     resolved_model = model or settings.ollama_model
 
+    # Resize large screenshots — moondream on CPU can't handle multi-MB images
+    if screenshot_b64:
+        screenshot_b64 = _resize_screenshot(screenshot_b64)
+
     messages = _build_ollama_messages(screenshot_b64, accessibility_tree, url, title)
 
     last_error: Exception | None = None
@@ -315,6 +416,8 @@ async def map_elements(
             )
 
             raw_text = await _call_ollama(messages, resolved_model)
+
+            logger.info("[ATTEMPT %d] Raw: %s", attempt + 1, raw_text[:300])
 
             # Parse JSON response
             raw_candidates = _parse_candidates(raw_text)
